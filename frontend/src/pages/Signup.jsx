@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
+import api from "../services/api";
 
 function Signup() {
   const navigate = useNavigate();
@@ -12,6 +13,7 @@ function Signup() {
   });
 
   const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
 
   const handleChange = (e) => {
     setFormData({
@@ -20,7 +22,7 @@ function Signup() {
     });
   };
 
-  const handleSubmit = (e) => {
+  const handleSubmit = async (e) => {
     e.preventDefault();
 
     setError("");
@@ -45,9 +47,32 @@ function Signup() {
       return;
     }
 
-    // Temporary navigation.
-    // Backend authentication will be connected next.
-    navigate("/login");
+    try {
+      setLoading(true);
+
+      await api.post("/auth/signup", {
+        name: formData.name,
+        email: formData.email,
+        password: formData.password,
+      });
+
+      navigate("/login");
+
+    } catch (error) {
+      console.error("Signup error:", error);
+
+      if (error.response) {
+        setError(
+          error.response.data.message || "Unable to create account."
+        );
+      } else {
+        setError(
+          "Unable to connect to the server. Please try again."
+        );
+      }
+    } finally {
+      setLoading(false);
+    }
   };
 
   return (
@@ -120,14 +145,19 @@ function Signup() {
             </div>
           )}
 
-          <button type="submit" className="auth-button">
-            Create Account
+          <button
+            type="submit"
+            className="auth-button"
+            disabled={loading}
+          >
+            {loading ? "Creating Account..." : "Create Account"}
           </button>
 
         </form>
 
         <div className="auth-footer">
           Already have an account?{" "}
+
           <Link to="/login">
             Login
           </Link>
