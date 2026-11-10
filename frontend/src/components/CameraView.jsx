@@ -1,199 +1,260 @@
-import { useEffect, useRef, useState } from "react";
-
-import {
-  FilesetResolver,
-  HandLandmarker,
-} from "@mediapipe/tasks-vision";
-
+import { useEffect, useRef, useState, useCallback } from "react";
+import { FilesetResolver, HandLandmarker } from "@mediapipe/tasks-vision";
 import api from "../services/api";
 
-function CameraView({ onStatusChange }) {
+const HAND_CONNECTIONS = [
+  [0, 1], [1, 2], [2, 3], [3, 4],       // Thumb
+  [0, 5], [5, 6], [6, 7], [7, 8],       // Index
+  [5, 9], [9, 10], [10, 11], [11, 12],   // Middle
+  [9, 13], [13, 14], [14, 15], [15, 16], // Ring
+  [13, 17], [17, 18], [18, 19], [19, 20],// Pinky
+  [0, 17]                               // Palm base
+];
+
+const PREDICTION_INTERVAL_MS = 90;
+const CONFIDENCE_THRESHOLD = 0.65;
+const STABLE_FRAMES_REQUIRED = 5;
+const RELEASE_FRAMES_REQUIRED = 4;
+
+function CameraView({ onStatusChange, onLetterCommitted }) {
   const videoRef = useRef(null);
+  const canvasRef = useRef(null);
   const streamRef = useRef(null);
 
-  // MediaPipe references
   const handLandmarkerRef = useRef(null);
   const animationFrameRef = useRef(null);
   const lastTimestampRef = useRef(0);
 
-  // ==================================================
-  // 30-FRAME SEQUENCE BUFFER
-  // ==================================================
-
-  const sequenceRef = useRef([]);
-
-  // Prevent multiple predictions at the same time
+  // Prediction state refs
   const isPredictingRef = useRef(false);
+  const lastPredictTimeRef = useRef(0);
+  const stabilityQueueRef = useRef([]);
+  const absentFramesRef = useRef(0);
+  const isArmedRef = useRef(true);
 
-  // ==================================================
-  // UI STATE
-  // ==================================================
-
+  // UI state
   const [cameraActive, setCameraActive] = useState(false);
   const [error, setError] = useState("");
   const [handsDetected, setHandsDetected] = useState(0);
-  const [sequenceLength, setSequenceLength] = useState(0);
-  const [prediction, setPrediction] = useState("");
-  const [predictionScore, setPredictionScore] = useState(null);
+  const [currentSign, setCurrentSign] = useState("-");
+  const [confidence, setConfidence] = useState(null);
+  const [stableCount, setStableCount] = useState(0);
+  const [isArmed, setIsArmed] = useState(true);
   const [isPredicting, setIsPredicting] = useState(false);
+  const [committedFlash, setCommittedFlash] = useState("");
 
-  // Send status updates up to Translator.jsx whenever any value changes
+  // Notify parent of telemetry updates
   useEffect(() => {
     if (onStatusChange) {
       onStatusChange({
         cameraActive,
         handsDetected,
-        sequenceLength,
-        prediction,
-        predictionScore,
+        stableCount,
+        maxStableFrames: STABLE_FRAMES_REQUIRED,
+        isArmed,
+        prediction: currentSign !== "-" ? currentSign : "",
+        predictionScore: confidence,
         isPredicting,
       });
     }
   }, [
     cameraActive,
     handsDetected,
-    sequenceLength,
-    prediction,
-    predictionScore,
+    stableCount,
+    isArmed,
+    currentSign,
+    confidence,
     isPredicting,
     onStatusChange,
   ]);
 
-  // ==================================================
-  // CONVERT HANDS INTO 126 FEATURES (WRIST-CENTERED)
-  // ==================================================
+  /**
+   * Normalize 21 hand landmarks:
+   * 1. Subtract wrist (landmarks[0])
+   * 2. Divide by max absolute coordinate (scale invariant)
+   */
+  const normalizeHand = (landmarks) => {
+    const wrist = landmarks[0];
+    const pts = landmarks.map((lm) => [lm.x - wrist.x, lm.y - wrist.y, lm.z - wrist.z]);
 
-  const extractFrameFeatures = (result) => {
-    const leftHand = new Array(63).fill(0);
-    const rightHand = new Array(63).fill(0);
-
-    // No hands detected
-    if (!result.landmarks || result.landmarks.length === 0) {
-      return [...leftHand, ...rightHand];
+    let maxVal = 0;
+    for (const [x, y, z] of pts) {
+      const ax = Math.abs(x);
+      const ay = Math.abs(y);
+      const az = Math.abs(z);
+      if (ax > maxVal) maxVal = ax;
+      if (ay > maxVal) maxVal = ay;
+      if (az > maxVal) maxVal = az;
     }
 
-    result.landmarks.forEach((hand, handIndex) => {
-      const handedness = result.handednesses?.[handIndex]?.[0];
-      const categoryName = handedness?.categoryName;
+    const scale = maxVal > 1e-6 ? maxVal : 1.0;
+    const flat = [];
+    for (const [x, y, z] of pts) {
+      flat.push(x / scale, y / scale, z / scale);
+    }
+    return flat; // 63 values
+  };
 
-      // Subtract wrist (hand[0]) to match training preprocessing
-      const handFeatures = [];
-      const wrist = hand[0];
+  /**
+   * Extract stable 126-feature vector: [Left 63, Right 63]
+   */
+  const extractFrameFeatures = (result) => {
+    const slots = {
+      Left: new Array(63).fill(0),
+      Right: new Array(63).fill(0),
+    };
 
-      hand.forEach((landmark) => {
-        handFeatures.push(landmark.x - wrist.x);
-        handFeatures.push(landmark.y - wrist.y);
-        handFeatures.push(landmark.z - wrist.z);
-      });
+    if (!result.landmarks || result.landmarks.length === 0) {
+      return null;
+    }
 
-      if (handFeatures.length !== 63) {
-        return;
+    const isSlotOccupied = (side) => slots[side].some((val) => val !== 0);
+
+    result.landmarks.forEach((handLandmarks, i) => {
+      let side = null;
+      const handedness = result.handednesses?.[i]?.[0];
+      if (handedness && handedness.categoryName) {
+        side = handedness.categoryName;
       }
 
-      if (categoryName === "Left") {
-        for (let i = 0; i < 63; i++) {
-          leftHand[i] = handFeatures[i];
-        }
-      } else if (categoryName === "Right") {
-        for (let i = 0; i < 63; i++) {
-          rightHand[i] = handFeatures[i];
-        }
+      if (!side || !slots[side] || isSlotOccupied(side)) {
+        side = !isSlotOccupied("Right") ? "Right" : "Left";
+      }
+
+      if (!isSlotOccupied(side)) {
+        slots[side] = normalizeHand(handLandmarks);
       }
     });
 
-    return [...leftHand, ...rightHand];
+    return [...slots.Left, ...slots.Right]; // 126 values
   };
 
-  // ==================================================
-  // SEND 30 FRAME SEQUENCE TO BACKEND
-  // ==================================================
+  /**
+   * Draw hand landmarks & connections on overlay canvas
+   */
+  const drawLandmarks = (result) => {
+    const canvas = canvasRef.current;
+    const video = videoRef.current;
+    if (!canvas || !video) return;
 
-  const sendSequenceForPrediction = async (sequence) => {
-    if (isPredictingRef.current) {
-      return;
+    if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
+      canvas.width = video.videoWidth || 1280;
+      canvas.height = video.videoHeight || 720;
     }
+
+    const ctx = canvas.getContext("2d");
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    if (!result.landmarks || result.landmarks.length === 0) return;
+
+    const w = canvas.width;
+    const h = canvas.height;
+
+    result.landmarks.forEach((landmarks) => {
+      // Draw skeleton lines
+      ctx.strokeStyle = "#38bdf8";
+      ctx.lineWidth = 3;
+      HAND_CONNECTIONS.forEach(([startIdx, endIdx]) => {
+        const start = landmarks[startIdx];
+        const end = landmarks[endIdx];
+        if (start && end) {
+          ctx.beginPath();
+          ctx.moveTo(start.x * w, start.y * h);
+          ctx.lineTo(end.x * w, end.y * h);
+          ctx.stroke();
+        }
+      });
+
+      // Draw landmark points
+      landmarks.forEach((pt, idx) => {
+        ctx.beginPath();
+        ctx.arc(pt.x * w, pt.y * h, idx === 0 ? 6 : 4, 0, 2 * Math.PI);
+        ctx.fillStyle = idx === 0 ? "#f43f5e" : "#10b981";
+        ctx.fill();
+        ctx.strokeStyle = "#ffffff";
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+      });
+    });
+  };
+
+  /**
+   * Send 126-feature vector to backend /api/predict
+   */
+  const sendForPrediction = async (features) => {
+    if (isPredictingRef.current) return;
+    const now = Date.now();
+    if (now - lastPredictTimeRef.current < PREDICTION_INTERVAL_MS) return;
 
     try {
       isPredictingRef.current = true;
+      lastPredictTimeRef.current = now;
       setIsPredicting(true);
 
-      const response = await api.post("/predict", {
-        sequence: sequence,
-      });
+      const response = await api.post("/predict", { features });
 
-      if (response.data.success) {
-        setPrediction(response.data.prediction);
-        setPredictionScore(response.data.score);
+      if (response.data && response.data.success) {
+        const predictedLabel = response.data.prediction;
+        const score = response.data.score;
+
+        setConfidence(score);
+
+        if (score >= CONFIDENCE_THRESHOLD) {
+          setCurrentSign(predictedLabel);
+
+          // Update stability tracking
+          const queue = stabilityQueueRef.current;
+          queue.push(predictedLabel);
+          if (queue.length > STABLE_FRAMES_REQUIRED) {
+            queue.shift();
+          }
+
+          // Count consecutive matches
+          let matches = 0;
+          for (let i = queue.length - 1; i >= 0; i--) {
+            if (queue[i] === predictedLabel) {
+              matches++;
+            } else {
+              break;
+            }
+          }
+          setStableCount(matches);
+
+          // If armed and stable enough, commit letter!
+          if (
+            isArmedRef.current &&
+            matches >= STABLE_FRAMES_REQUIRED &&
+            predictedLabel !== "?"
+          ) {
+            if (onLetterCommitted) {
+              onLetterCommitted(predictedLabel);
+            }
+            setCommittedFlash(predictedLabel);
+            setTimeout(() => setCommittedFlash(""), 1200);
+
+            isArmedRef.current = false;
+            setIsArmed(false);
+            stabilityQueueRef.current = [];
+            setStableCount(0);
+          }
+        } else {
+          setCurrentSign("?");
+          stabilityQueueRef.current = [];
+          setStableCount(0);
+        }
       }
     } catch (err) {
-      console.error("AI PREDICTION ERROR:", err);
-      setError("Unable to get prediction from the AI model.");
+      console.error("AI Prediction request failed:", err);
     } finally {
       isPredictingRef.current = false;
       setIsPredicting(false);
     }
   };
 
-  // ==================================================
-  // ADD FRAME TO SEQUENCE
-  // ==================================================
-
-  const addFrameToSequence = (features) => {
-    if (features.length !== 126) return;
-
-    sequenceRef.current.push(features);
-
-    if (sequenceRef.current.length > 30) {
-      sequenceRef.current.shift();
-    }
-
-    setSequenceLength(sequenceRef.current.length);
-
-    if (sequenceRef.current.length === 30 && !isPredictingRef.current) {
-      const sequenceToSend = [...sequenceRef.current];
-      sendSequenceForPrediction(sequenceToSend);
-      sequenceRef.current = [];
-      setSequenceLength(0);
-    }
-  };
-
-  // ==================================================
-  // INITIALIZE MEDIAPIPE
-  // ==================================================
-
-  const initializeHandLandmarker = async () => {
-    try {
-      setError("");
-
-      const vision = await FilesetResolver.forVisionTasks("/mediapipe-wasm");
-
-      handLandmarkerRef.current = await HandLandmarker.createFromOptions(
-        vision,
-        {
-          baseOptions: {
-            modelAssetPath: "/hand_landmarker.task",
-            delegate: "GPU",
-          },
-          runningMode: "VIDEO",
-          numHands: 2,
-        }
-      );
-
-      lastTimestampRef.current = 0;
-      detectHands();
-    } catch (err) {
-      console.error("MediaPipe initialization error:", err);
-      setError(
-        "MediaPipe initialization failed. Please check console (F12) for details."
-      );
-    }
-  };
-
-  // ==================================================
-  // DETECT HANDS
-  // ==================================================
-
-  const detectHands = () => {
+  /**
+   * Continuous hand detection loop
+   */
+  const detectHands = useCallback(() => {
     if (
       !videoRef.current ||
       !handLandmarkerRef.current ||
@@ -204,7 +265,7 @@ function CameraView({ onStatusChange }) {
     }
 
     try {
-      const timestamp = lastTimestampRef.current + 1;
+      const timestamp = performance.now();
       lastTimestampRef.current = timestamp;
 
       const result = handLandmarkerRef.current.detectForVideo(
@@ -214,29 +275,73 @@ function CameraView({ onStatusChange }) {
 
       const count = result.landmarks?.length || 0;
       setHandsDetected(count);
+      drawLandmarks(result);
 
       if (count > 0) {
+        absentFramesRef.current = 0;
         const features = extractFrameFeatures(result);
-        addFrameToSequence(features);
+        if (features && features.length === 126) {
+          sendForPrediction(features);
+        }
+      } else {
+        // Hands absent: clear candidate & check re-arming
+        absentFramesRef.current++;
+        if (absentFramesRef.current >= RELEASE_FRAMES_REQUIRED) {
+          if (!isArmedRef.current) {
+            isArmedRef.current = true;
+            setIsArmed(true);
+          }
+          stabilityQueueRef.current = [];
+          setStableCount(0);
+          setCurrentSign("-");
+          setConfidence(null);
+        }
       }
     } catch (err) {
       console.error("Hand detection error:", err);
     }
 
     animationFrameRef.current = requestAnimationFrame(detectHands);
+  }, []);
+
+  /**
+   * Initialize MediaPipe HandLandmarker
+   */
+  const initializeHandLandmarker = async () => {
+    try {
+      setError("");
+      const vision = await FilesetResolver.forVisionTasks("/mediapipe-wasm");
+
+      handLandmarkerRef.current = await HandLandmarker.createFromOptions(vision, {
+        baseOptions: {
+          modelAssetPath: "/hand_landmarker.task",
+          delegate: "GPU",
+        },
+        runningMode: "VIDEO",
+        numHands: 2,
+      });
+
+      lastTimestampRef.current = 0;
+      detectHands();
+    } catch (err) {
+      console.error("MediaPipe initialization error:", err);
+      setError("MediaPipe initialization failed. Check browser console for details.");
+    }
   };
 
-  // ==================================================
-  // START CAMERA
-  // ==================================================
-
+  /**
+   * Start Camera stream
+   */
   const startCamera = async () => {
     try {
       setError("");
-      sequenceRef.current = [];
-      setSequenceLength(0);
-      setPrediction("");
-      setPredictionScore(null);
+      stabilityQueueRef.current = [];
+      absentFramesRef.current = 0;
+      isArmedRef.current = true;
+      setIsArmed(true);
+      setStableCount(0);
+      setCurrentSign("-");
+      setConfidence(null);
       isPredictingRef.current = false;
       setIsPredicting(false);
 
@@ -270,15 +375,14 @@ function CameraView({ onStatusChange }) {
       } else if (err.name === "NotFoundError") {
         setError("No camera was found on this device.");
       } else {
-        setError("Unable to access the camera.");
+        setError("Unable to access the camera: " + err.message);
       }
     }
   };
 
-  // ==================================================
-  // STOP CAMERA
-  // ==================================================
-
+  /**
+   * Stop Camera stream
+   */
   const stopCamera = () => {
     if (animationFrameRef.current) {
       cancelAnimationFrame(animationFrameRef.current);
@@ -294,18 +398,23 @@ function CameraView({ onStatusChange }) {
       videoRef.current.srcObject = null;
     }
 
+    if (canvasRef.current) {
+      const ctx = canvasRef.current.getContext("2d");
+      ctx.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height);
+    }
+
     if (handLandmarkerRef.current) {
       handLandmarkerRef.current.close();
       handLandmarkerRef.current = null;
     }
 
     lastTimestampRef.current = 0;
-    sequenceRef.current = [];
-    setSequenceLength(0);
+    stabilityQueueRef.current = [];
+    setStableCount(0);
     setCameraActive(false);
     setHandsDetected(0);
-    setPrediction("");
-    setPredictionScore(null);
+    setCurrentSign("-");
+    setConfidence(null);
     isPredictingRef.current = false;
     setIsPredicting(false);
   };
@@ -328,26 +437,22 @@ function CameraView({ onStatusChange }) {
     <div className="camera-view">
       <div className="camera-header">
         <div>
-          <h2>Camera</h2>
-          <p>Live camera stream for ISL recognition</p>
+          <h2>Live ISL Camera</h2>
+          <p>Real-time fingerspelling & word recognition</p>
         </div>
 
-        <div
-          className={`camera-status ${
-            cameraActive ? "camera-status-active" : ""
-          }`}
-        >
+        <div className={`camera-status ${cameraActive ? "camera-status-active" : ""}`}>
           <span></span>
           {cameraActive ? "Camera Active" : "Camera Off"}
         </div>
       </div>
 
-      <div className="camera-screen">
+      <div className="camera-screen" style={{ position: "relative" }}>
         {!cameraActive && (
           <div className="camera-placeholder">
             <div className="camera-icon">📷</div>
             <h3>Camera is currently off</h3>
-            <p>Click the button below to allow camera access.</p>
+            <p>Click Start Camera to begin recognizing Indian Sign Language.</p>
           </div>
         )}
 
@@ -356,15 +461,75 @@ function CameraView({ onStatusChange }) {
           autoPlay
           playsInline
           muted
-          className={`camera-video ${
-            cameraActive ? "camera-video-active" : ""
-          }`}
+          className={`camera-video ${cameraActive ? "camera-video-active" : ""}`}
+          style={{ width: "100%", height: "100%", objectFit: "cover" }}
+        />
+
+        <canvas
+          ref={canvasRef}
+          style={{
+            position: "absolute",
+            top: 0,
+            left: 0,
+            width: "100%",
+            height: "100%",
+            pointerEvents: "none",
+          }}
         />
 
         {cameraActive && (
-          <div className="live-badge">
+          <div className="live-badge" style={{ display: "flex", alignItems: "center", gap: "6px" }}>
             <span></span>
-            LIVE
+            {handsDetected === 2
+              ? "🟢 2 HANDS DETECTED"
+              : handsDetected === 1
+              ? "🟡 1 HAND DETECTED"
+              : "LIVE TRACKING"}
+          </div>
+        )}
+
+        {cameraActive && handsDetected === 1 && (
+          <div
+            style={{
+              position: "absolute",
+              bottom: "12px",
+              left: "50%",
+              transform: "translateX(-50%)",
+              background: "rgba(17, 24, 39, 0.85)",
+              color: "#fbbf24",
+              fontSize: "0.75rem",
+              fontWeight: "600",
+              padding: "6px 14px",
+              borderRadius: "20px",
+              backdropFilter: "blur(4px)",
+              pointerEvents: "none",
+              whiteSpace: "nowrap",
+              boxShadow: "0 2px 8px rgba(0,0,0,0.2)",
+            }}
+          >
+            💡 For 2-hand signs (H, M, W): Keep a small 1-inch gap so both are tracked
+          </div>
+        )}
+
+        {committedFlash && (
+          <div
+            style={{
+              position: "absolute",
+              top: "50%",
+              left: "50%",
+              transform: "translate(-50%, -50%)",
+              background: "rgba(16, 185, 129, 0.92)",
+              color: "#ffffff",
+              fontSize: "4rem",
+              fontWeight: "800",
+              borderRadius: "16px",
+              padding: "20px 40px",
+              boxShadow: "0 10px 25px rgba(0,0,0,0.3)",
+              pointerEvents: "none",
+              animation: "pulse 0.5s ease",
+            }}
+          >
+            + {committedFlash}
           </div>
         )}
       </div>
