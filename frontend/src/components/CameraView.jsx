@@ -170,8 +170,8 @@ function CameraView({ onStatusChange, onRecognizedText, onEditReady }) {
         captureCanvasRef.current = document.createElement("canvas");
       }
       const capture = captureCanvasRef.current;
-      capture.width = 640;
-      capture.height = Math.round(640 * video.videoHeight / video.videoWidth);
+      capture.width = 960;
+capture.height = Math.round(960 * video.videoHeight / video.videoWidth);
       const ctx = capture.getContext("2d");
       if (!ctx) return;
       ctx.drawImage(video, 0, 0, capture.width, capture.height);
@@ -185,7 +185,8 @@ function CameraView({ onStatusChange, onRecognizedText, onEditReady }) {
       if (!activeRef.current || epoch !== requestEpochRef.current ||
           editVersion !== editVersionRef.current || editingRef.current) return;
       const data = response.data;
-      setError("");
+console.log("ISL DEBUG:", data);
+setError("");
       const nextSign = data.prediction || "-";
       const signCandidate = signCandidateRef.current;
       signCandidate.count = signCandidate.value === nextSign ? signCandidate.count + 1 : 1;
