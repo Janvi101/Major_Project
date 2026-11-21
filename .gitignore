@@ -1,0 +1,19 @@
+# Node.js
+node_modules/
+dist/
+# Environment variables
+.env
+.env.*
+!.env.example
+# Python
+venv/
+.venv/
+__pycache__/
+*.pyc
+# Logs
+*.log
+# Backup files
+*_backup.py
+*_backup.jsx
+*.before_symbols_fix
+*_before_text_fix.jsx

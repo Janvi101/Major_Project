@@ -1,6 +1,6 @@
-import { useEffect, useRef, useState, useCallback } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { FilesetResolver, HandLandmarker } from "@mediapipe/tasks-vision";
-import api from "../services/api";
+import islApi from "../services/islApi";
 
 const HAND_CONNECTIONS = [
   [0, 1], [1, 2], [2, 3], [3, 4],       // Thumb
@@ -11,16 +11,24 @@ const HAND_CONNECTIONS = [
   [0, 17]                               // Palm base
 ];
 
-const PREDICTION_INTERVAL_MS = 90;
-const CONFIDENCE_THRESHOLD = 0.65;
-const STABLE_FRAMES_REQUIRED = 5;
-const RELEASE_FRAMES_REQUIRED = 4;
+const PREDICTION_INTERVAL_MS = 50;
+const STABLE_FRAMES_REQUIRED = 8; // Python model handles stability
 
-function CameraView({ onStatusChange, onLetterCommitted }) {
+function CameraView({ onStatusChange, onRecognizedText, onEditReady }) {
   const videoRef = useRef(null);
   const canvasRef = useRef(null);
   const streamRef = useRef(null);
-
+  const sessionIdRef = useRef(`isl-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+  const captureCanvasRef = useRef(null);
+  const activeRef = useRef(false);
+  const requestEpochRef = useRef(0);
+  const previousTextRef = useRef("");
+  const editVersionRef = useRef(0);
+  const editingRef = useRef(false);
+  const handCandidateRef = useRef({ value: 0, count: 0 });
+  const signCandidateRef = useRef({ value: "-", count: 0 });
+  const recognizedTextCallbackRef = useRef(onRecognizedText);
+  recognizedTextCallbackRef.current = onRecognizedText;
   const handLandmarkerRef = useRef(null);
   const animationFrameRef = useRef(null);
   const lastTimestampRef = useRef(0);
@@ -28,9 +36,6 @@ function CameraView({ onStatusChange, onLetterCommitted }) {
   // Prediction state refs
   const isPredictingRef = useRef(false);
   const lastPredictTimeRef = useRef(0);
-  const stabilityQueueRef = useRef([]);
-  const absentFramesRef = useRef(0);
-  const isArmedRef = useRef(true);
 
   // UI state
   const [cameraActive, setCameraActive] = useState(false);
@@ -42,6 +47,33 @@ function CameraView({ onStatusChange, onLetterCommitted }) {
   const [isArmed, setIsArmed] = useState(true);
   const [isPredicting, setIsPredicting] = useState(false);
   const [committedFlash, setCommittedFlash] = useState("");
+
+  // All manual edits go to the same Python session that recognizes signs.
+  const editText = useCallback(async (action) => {
+    if (!activeRef.current || editingRef.current) return;
+    editingRef.current = true;
+    editVersionRef.current += 1; // Invalidate an older /predict response.
+    try {
+      const response = await islApi.post("/edit-text", {
+        session_id: sessionIdRef.current,
+        action,
+      });
+      const text = response.data.text ?? "";
+      previousTextRef.current = text;
+      recognizedTextCallbackRef.current?.(text);
+      setError("");
+    } catch (err) {
+      console.error("Text edit failed:", err);
+      setError("Could not update text in Python. Please try again.");
+    } finally {
+      editingRef.current = false;
+    }
+  }, []);
+
+  useEffect(() => {
+    onEditReady?.(editText);
+    return () => onEditReady?.(null);
+  }, [onEditReady, editText]);
 
   // Notify parent of telemetry updates
   useEffect(() => {
@@ -67,67 +99,6 @@ function CameraView({ onStatusChange, onLetterCommitted }) {
     isPredicting,
     onStatusChange,
   ]);
-
-  /**
-   * Normalize 21 hand landmarks:
-   * 1. Subtract wrist (landmarks[0])
-   * 2. Divide by max absolute coordinate (scale invariant)
-   */
-  const normalizeHand = (landmarks) => {
-    const wrist = landmarks[0];
-    const pts = landmarks.map((lm) => [lm.x - wrist.x, lm.y - wrist.y, lm.z - wrist.z]);
-
-    let maxVal = 0;
-    for (const [x, y, z] of pts) {
-      const ax = Math.abs(x);
-      const ay = Math.abs(y);
-      const az = Math.abs(z);
-      if (ax > maxVal) maxVal = ax;
-      if (ay > maxVal) maxVal = ay;
-      if (az > maxVal) maxVal = az;
-    }
-
-    const scale = maxVal > 1e-6 ? maxVal : 1.0;
-    const flat = [];
-    for (const [x, y, z] of pts) {
-      flat.push(x / scale, y / scale, z / scale);
-    }
-    return flat; // 63 values
-  };
-
-  /**
-   * Extract stable 126-feature vector: [Left 63, Right 63]
-   */
-  const extractFrameFeatures = (result) => {
-    const slots = {
-      Left: new Array(63).fill(0),
-      Right: new Array(63).fill(0),
-    };
-
-    if (!result.landmarks || result.landmarks.length === 0) {
-      return null;
-    }
-
-    const isSlotOccupied = (side) => slots[side].some((val) => val !== 0);
-
-    result.landmarks.forEach((handLandmarks, i) => {
-      let side = null;
-      const handedness = result.handednesses?.[i]?.[0];
-      if (handedness && handedness.categoryName) {
-        side = handedness.categoryName;
-      }
-
-      if (!side || !slots[side] || isSlotOccupied(side)) {
-        side = !isSlotOccupied("Right") ? "Right" : "Left";
-      }
-
-      if (!isSlotOccupied(side)) {
-        slots[side] = normalizeHand(handLandmarks);
-      }
-    });
-
-    return [...slots.Left, ...slots.Right]; // 126 values
-  };
 
   /**
    * Draw hand landmarks & connections on overlay canvas
@@ -178,131 +149,107 @@ function CameraView({ onStatusChange, onLetterCommitted }) {
     });
   };
 
-  /**
-   * Send 126-feature vector to backend /api/predict
-   */
-  const sendForPrediction = async (features) => {
-    if (isPredictingRef.current) return;
+  // Send raw, unmirrored camera pixels to Python. Python flips the image
+  // before MediaPipe, matching the original working realtime_app.py.
+  const sendForPrediction = async () => {
+    if (!activeRef.current || isPredictingRef.current || editingRef.current) return;
     const now = Date.now();
     if (now - lastPredictTimeRef.current < PREDICTION_INTERVAL_MS) return;
 
+    const video = videoRef.current;
+    if (!video || video.readyState < 2 || !video.videoWidth) return;
+
+    const epoch = requestEpochRef.current;
+    const editVersion = editVersionRef.current;
     try {
       isPredictingRef.current = true;
       lastPredictTimeRef.current = now;
       setIsPredicting(true);
 
-      const response = await api.post("/predict", { features });
+      if (!captureCanvasRef.current) {
+        captureCanvasRef.current = document.createElement("canvas");
+      }
+      const capture = captureCanvasRef.current;
+      capture.width = 640;
+      capture.height = Math.round(640 * video.videoHeight / video.videoWidth);
+      const ctx = capture.getContext("2d");
+      if (!ctx) return;
+      ctx.drawImage(video, 0, 0, capture.width, capture.height);
 
-      if (response.data && response.data.success) {
-        const predictedLabel = response.data.prediction;
-        const score = response.data.score;
+      const response = await islApi.post("/predict", {
+        image: capture.toDataURL("image/jpeg", 0.8),
+        session_id: sessionIdRef.current,
+      });
 
-        setConfidence(score);
+      // Ignore replies from a camera session that has been stopped/restarted.
+      if (!activeRef.current || epoch !== requestEpochRef.current ||
+          editVersion !== editVersionRef.current || editingRef.current) return;
+      const data = response.data;
+      setError("");
+      const nextSign = data.prediction || "-";
+      const signCandidate = signCandidateRef.current;
+      signCandidate.count = signCandidate.value === nextSign ? signCandidate.count + 1 : 1;
+      signCandidate.value = nextSign;
+      // Smooth the display only; Python still processes every frame normally.
+      if (signCandidate.count >= 2) {
+  setCurrentSign(nextSign);
+  setConfidence(data.confidence ?? null);
+}
+      setIsArmed(Boolean(data.armed));
+      const nextCount = data.hands_detected ?? 0;
+      const handCandidate = handCandidateRef.current;
+      handCandidate.count = handCandidate.value === nextCount ? handCandidate.count + 1 : 1;
+      handCandidate.value = nextCount;
+      if (handCandidate.count >= 3) setHandsDetected(nextCount);
 
-        if (score >= CONFIDENCE_THRESHOLD) {
-          setCurrentSign(predictedLabel);
-
-          // Update stability tracking
-          const queue = stabilityQueueRef.current;
-          queue.push(predictedLabel);
-          if (queue.length > STABLE_FRAMES_REQUIRED) {
-            queue.shift();
-          }
-
-          // Count consecutive matches
-          let matches = 0;
-          for (let i = queue.length - 1; i >= 0; i--) {
-            if (queue[i] === predictedLabel) {
-              matches++;
-            } else {
-              break;
+      const text = data.text ?? "";
+      if (text !== previousTextRef.current) {
+        const oldText = previousTextRef.current;
+        previousTextRef.current = text;
+        recognizedTextCallbackRef.current?.(text);
+        if (text.startsWith(oldText) && text.length > oldText.length) {
+          const added = text.slice(oldText.length);
+          setCommittedFlash(added === " " ? "SPACE" : added);
+          window.setTimeout(() => {
+            if (activeRef.current && epoch === requestEpochRef.current) {
+              setCommittedFlash("");
             }
-          }
-          setStableCount(matches);
-
-          // If armed and stable enough, commit letter!
-          if (
-            isArmedRef.current &&
-            matches >= STABLE_FRAMES_REQUIRED &&
-            predictedLabel !== "?"
-          ) {
-            if (onLetterCommitted) {
-              onLetterCommitted(predictedLabel);
-            }
-            setCommittedFlash(predictedLabel);
-            setTimeout(() => setCommittedFlash(""), 1200);
-
-            isArmedRef.current = false;
-            setIsArmed(false);
-            stabilityQueueRef.current = [];
-            setStableCount(0);
-          }
-        } else {
-          setCurrentSign("?");
-          stabilityQueueRef.current = [];
-          setStableCount(0);
+          }, 1200);
         }
       }
     } catch (err) {
-      console.error("AI Prediction request failed:", err);
+      if (activeRef.current && epoch === requestEpochRef.current) {
+        console.error("Python recognition request failed:", err);
+        setError("Cannot reach the Python recognition API on port 8000.");
+      }
     } finally {
-      isPredictingRef.current = false;
-      setIsPredicting(false);
+      if (epoch === requestEpochRef.current) {
+        isPredictingRef.current = false;
+        setIsPredicting(false);
+      }
     }
   };
 
-  /**
-   * Continuous hand detection loop
-   */
-  const detectHands = useCallback(() => {
-    if (
-      !videoRef.current ||
-      !handLandmarkerRef.current ||
-      videoRef.current.readyState < 2
-    ) {
-      animationFrameRef.current = requestAnimationFrame(detectHands);
-      return;
-    }
-
-    try {
-      const timestamp = performance.now();
-      lastTimestampRef.current = timestamp;
-
-      const result = handLandmarkerRef.current.detectForVideo(
-        videoRef.current,
-        timestamp
-      );
-
-      const count = result.landmarks?.length || 0;
-      setHandsDetected(count);
-      drawLandmarks(result);
-
-      if (count > 0) {
-        absentFramesRef.current = 0;
-        const features = extractFrameFeatures(result);
-        if (features && features.length === 126) {
-          sendForPrediction(features);
-        }
-      } else {
-        // Hands absent: clear candidate & check re-arming
-        absentFramesRef.current++;
-        if (absentFramesRef.current >= RELEASE_FRAMES_REQUIRED) {
-          if (!isArmedRef.current) {
-            isArmedRef.current = true;
-            setIsArmed(true);
-          }
-          stabilityQueueRef.current = [];
-          setStableCount(0);
-          setCurrentSign("-");
-          setConfidence(null);
-        }
+  // Browser MediaPipe is used only for the blue landmark overlay.
+  // Python independently performs ALL recognition, including no-hand release.
+  const detectHands = () => {
+    if (!activeRef.current) return;
+    const video = videoRef.current;
+    if (video && handLandmarkerRef.current && video.readyState >= 2) {
+      try {
+        const timestamp = performance.now();
+        lastTimestampRef.current = timestamp;
+        const result = handLandmarkerRef.current.detectForVideo(video, timestamp);
+        drawLandmarks(result);
+        sendForPrediction(); // Always send frames, even with zero hands.
+      } catch (err) {
+        console.error("Hand detection error:", err);
       }
-    } catch (err) {
-      console.error("Hand detection error:", err);
     }
-
-    animationFrameRef.current = requestAnimationFrame(detectHands);
-  }, []);
+    if (activeRef.current) {
+      animationFrameRef.current = requestAnimationFrame(detectHands);
+    }
+  };
 
   /**
    * Initialize MediaPipe HandLandmarker
@@ -322,7 +269,7 @@ function CameraView({ onStatusChange, onLetterCommitted }) {
       });
 
       lastTimestampRef.current = 0;
-      detectHands();
+      if (activeRef.current) detectHands();
     } catch (err) {
       console.error("MediaPipe initialization error:", err);
       setError("MediaPipe initialization failed. Check browser console for details.");
@@ -335,14 +282,22 @@ function CameraView({ onStatusChange, onLetterCommitted }) {
   const startCamera = async () => {
     try {
       setError("");
-      stabilityQueueRef.current = [];
-      absentFramesRef.current = 0;
-      isArmedRef.current = true;
+      requestEpochRef.current += 1;
+      const epoch = requestEpochRef.current;
+      activeRef.current = false;
+      sessionIdRef.current = `isl-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      previousTextRef.current = "";
+      editVersionRef.current += 1;
+      editingRef.current = false;
+      handCandidateRef.current = { value: 0, count: 0 };
+      signCandidateRef.current = { value: "-", count: 0 };
+      setHandsDetected(0);
       setIsArmed(true);
       setStableCount(0);
       setCurrentSign("-");
       setConfidence(null);
       isPredictingRef.current = false;
+      lastPredictTimeRef.current = 0;
       setIsPredicting(false);
 
       if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
@@ -366,16 +321,26 @@ function CameraView({ onStatusChange, onLetterCommitted }) {
         await videoRef.current.play();
       }
 
+      // Initialize the Python session before beginning recognition.
+      await islApi.post("/reset", { session_id: sessionIdRef.current });
+      if (epoch !== requestEpochRef.current) return;
+      recognizedTextCallbackRef.current?.("");
+      activeRef.current = true;
       setCameraActive(true);
       await initializeHandLandmarker();
     } catch (err) {
       console.error("Camera error:", err);
+      activeRef.current = false;
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach((track) => track.stop());
+        streamRef.current = null;
+      }
       if (err.name === "NotAllowedError") {
         setError("Camera permission was denied. Please allow camera access in your browser.");
       } else if (err.name === "NotFoundError") {
         setError("No camera was found on this device.");
       } else {
-        setError("Unable to access the camera: " + err.message);
+        setError("Unable to start camera or Python API: " + err.message);
       }
     }
   };
@@ -384,6 +349,9 @@ function CameraView({ onStatusChange, onLetterCommitted }) {
    * Stop Camera stream
    */
   const stopCamera = () => {
+    activeRef.current = false;
+    requestEpochRef.current += 1;
+    editVersionRef.current += 1;
     if (animationFrameRef.current) {
       cancelAnimationFrame(animationFrameRef.current);
       animationFrameRef.current = null;
@@ -409,7 +377,6 @@ function CameraView({ onStatusChange, onLetterCommitted }) {
     }
 
     lastTimestampRef.current = 0;
-    stabilityQueueRef.current = [];
     setStableCount(0);
     setCameraActive(false);
     setHandsDetected(0);
@@ -421,6 +388,8 @@ function CameraView({ onStatusChange, onLetterCommitted }) {
 
   useEffect(() => {
     return () => {
+      activeRef.current = false;
+      requestEpochRef.current += 1;
       if (animationFrameRef.current) {
         cancelAnimationFrame(animationFrameRef.current);
       }
@@ -462,21 +431,26 @@ function CameraView({ onStatusChange, onLetterCommitted }) {
           playsInline
           muted
           className={`camera-video ${cameraActive ? "camera-video-active" : ""}`}
-          style={{ width: "100%", height: "100%", objectFit: "cover" }}
+          style={{
+  width: "100%",
+  height: "100%",
+  objectFit: "cover",
+  transform: "scaleX(-1)",
+}}
         />
 
         <canvas
-          ref={canvasRef}
-          style={{
-            position: "absolute",
-            top: 0,
-            left: 0,
-            width: "100%",
-            height: "100%",
-            pointerEvents: "none",
-          }}
-        />
-
+  ref={canvasRef}
+  style={{
+    position: "absolute",
+    top: 0,
+    left: 0,
+    width: "100%",
+    height: "100%",
+    pointerEvents: "none",
+    transform: "scaleX(-1)",
+  }}
+/>
         {cameraActive && (
           <div className="live-badge" style={{ display: "flex", alignItems: "center", gap: "6px" }}>
             <span></span>

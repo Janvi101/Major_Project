@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import CameraView from "../components/CameraView";
 
 const SIGN_HINTS = {
@@ -49,21 +49,25 @@ function Translator() {
   const [showSignGuide, setShowSignGuide] = useState(false);
   const [selectedGuideLetter, setSelectedGuideLetter] = useState("H");
 
-  // Append committed letter to word text
-  const handleLetterCommitted = useCallback((letter) => {
-    setRecognizedText((prev) => prev + letter);
+  const editTextRef = useRef(null);
+  const handleEditReady = useCallback((editFn) => {
+    editTextRef.current = editFn;
+  }, []);
+
+  const handleRecognizedText = useCallback((text) => {
+    setRecognizedText(text);
   }, []);
 
   const handleSpace = useCallback(() => {
-    setRecognizedText((prev) => (prev && !prev.endsWith(" ") ? prev + " " : prev));
+    editTextRef.current?.("space");
   }, []);
 
   const handleBackspace = useCallback(() => {
-    setRecognizedText((prev) => prev.slice(0, -1));
+    editTextRef.current?.("backspace");
   }, []);
 
   const handleClear = useCallback(() => {
-    setRecognizedText("");
+    editTextRef.current?.("clear");
   }, []);
 
   const handleSpeak = useCallback(() => {
@@ -227,9 +231,10 @@ function Translator() {
           {/* Left Panel: Camera Stream with Landmark Overlay */}
           <section className="translator-card">
             <CameraView
-              onStatusChange={setTelemetry}
-              onLetterCommitted={handleLetterCommitted}
-            />
+  onStatusChange={setTelemetry}
+  onRecognizedText={handleRecognizedText}
+  onEditReady={handleEditReady}
+/>
           </section>
 
           {/* Right Panel: Telemetry, AI Detection & Word Assembly */}
@@ -245,7 +250,7 @@ function Translator() {
                   telemetry.cameraActive ? "ai-status-active" : ""
                 }`}
               >
-                ● {telemetry.isPredicting
+                � {telemetry.isPredicting
                   ? "Predicting..."
                   : telemetry.cameraActive
                   ? "Detecting"
@@ -454,7 +459,7 @@ function Translator() {
                     cursor: "pointer",
                   }}
                 >
-                  ␣ Space
+                  � Space
                 </button>
 
                 <button
